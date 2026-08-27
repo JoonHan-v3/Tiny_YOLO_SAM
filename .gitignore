@@ -1,0 +1,30 @@
+# Vendored third-party repos (huge, each has its own git history/checkpoints —
+# see README.md for how to fetch these instead of committing them here)
+/Yolov12/
+/TinySAM/
+
+# Model weights
+checkpoints/
+*.pt
+*.pth
+*.pkl
+*.onnx
+
+# Datasets (see README.md for download instructions)
+dataset/
+
+# Generated outputs
+outputs/
+COCO_res_tinysam_yolo.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Editor / IDE
+.vscode/
+
+# OS
+.DS_Store
