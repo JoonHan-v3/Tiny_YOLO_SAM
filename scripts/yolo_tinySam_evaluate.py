@@ -1,4 +1,4 @@
-import os, sys, json
+import argparse, hashlib, os, sys, json
 from pathlib import Path
 
 import numpy as np
@@ -56,10 +56,9 @@ def generate_bboxes(val_img_path, in_json, yolo_checkpoint, out_json="coco_bboxe
     all_records = []
 
     yolo_model = load_yolo_model(yolo_checkpoint)
-    count = 0
+    if max_count is not None:
+        img_ids = img_ids[:max_count]
     for img_id in img_ids:
-        if max_count is not None and count >= max_count:
-            break
 
         img_file_name = f"{img_id:012d}.jpg"
         img_path = os.path.join(val_img_path, img_file_name)
@@ -68,8 +67,10 @@ def generate_bboxes(val_img_path, in_json, yolo_checkpoint, out_json="coco_bboxe
             continue
 
         image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        result = yolo12_predict(image, yolo_model)
+        # ultralytics treats numpy arrays as BGR (it flips to RGB internally)
+        result = yolo12_predict(image_bgr, yolo_model)
 
+        # yolo12_predict returns a dict (no tuple) when nothing is detected
         if not isinstance(result, (list, tuple)) or len(result) not in (2, 3):
             continue
         if len(result) == 3:
@@ -112,10 +113,8 @@ def generate_bboxes(val_img_path, in_json, yolo_checkpoint, out_json="coco_bboxe
             }
             all_records.append(record)
 
-        count += 1
 
-    cwd = os.getcwd()
-    outputs_dir = os.path.join(cwd, "outputs")
+    outputs_dir = str(ROOT / "outputs")
     os.makedirs(outputs_dir, exist_ok=True)
     out_json = os.path.join(outputs_dir, out_json)  # where out_json_name is the filename
 
@@ -124,12 +123,47 @@ def generate_bboxes(val_img_path, in_json, yolo_checkpoint, out_json="coco_bboxe
 
     print(f"Saved to: {out_json}")
 
-def eval_zero_shot(val_img_path,val_json_path,sam_checkpoint_path, yolo_checkpoint_path, bbox_file_path = "coco_bboxes.json", max_count=None ):
-    cwd = os.getcwd()
-    bbox_file = os.path.join(cwd, 'outputs', bbox_file_path)
-    if os.path.exists(bbox_file) is False:
+def _file_signature(path):
+    st = os.stat(path)
+    return {"path": os.path.abspath(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+
+
+def _dir_digest(path):
+    """Hash of every file's name, size and mtime, so edited/replaced images invalidate the cache."""
+    h = hashlib.sha256()
+    for entry in sorted(os.scandir(path), key=lambda e: e.name):
+        st = entry.stat()
+        h.update(f"{entry.name}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+    return h.hexdigest()
+
+
+def eval_zero_shot(val_img_path,val_json_path,sam_checkpoint_path, yolo_checkpoint_path, bbox_file_path = "coco_bboxes.json", max_count=None, use_center_points=False):
+    outputs_dir = str(ROOT / "outputs")
+    if max_count is not None:
+        # a subset run must not reuse (or overwrite) the full-set box cache
+        stem, ext = os.path.splitext(bbox_file_path)
+        bbox_file_path = f"{stem}_{max_count}{ext}"
+    bbox_file = os.path.join(outputs_dir, bbox_file_path)
+    # the cached boxes are only valid for the same detector weights, annotations and subset
+    signature = {
+        "yolo_checkpoint": _file_signature(yolo_checkpoint_path),
+        "annotations": _file_signature(val_json_path),
+        "image_dir": os.path.abspath(val_img_path),
+        "images": _dir_digest(val_img_path),
+        "max_count": max_count,
+    }
+    meta_file = bbox_file + ".meta.json"
+    cache_valid = os.path.exists(bbox_file) and os.path.exists(meta_file)
+    if cache_valid:
+        with open(meta_file) as f:
+            cache_valid = json.load(f) == signature
+        if not cache_valid:
+            print("Cached boxes are stale (checkpoint/annotations changed); regenerating...")
+    if not cache_valid:
         print("Generating bounding boxes using YOLOv12...")
         generate_bboxes(val_img_path, val_json_path, yolo_checkpoint_path, out_json=bbox_file_path, max_count=max_count )
+        with open(meta_file, "w") as f:
+            json.dump(signature, f)
 
     print("============== Evaluating on COCO dataset:",sam_checkpoint_path)
     with open(bbox_file) as f:
@@ -164,9 +198,13 @@ def eval_zero_shot(val_img_path,val_json_path,sam_checkpoint_path, yolo_checkpoi
         input_box=res_ins['bbox']
         input_box=[input_box[0],input_box[1],input_box[0]+input_box[2],input_box[1]+input_box[3]]
         input_box = np.array(input_box)
+        point_coords = point_labels = None
+        if use_center_points:
+            point_coords = np.array([[(input_box[0] + input_box[2]) / 2, (input_box[1] + input_box[3]) / 2]], dtype=np.float32)
+            point_labels = np.array([1], dtype=np.int32)
         masks, ious, _ = predictor.predict(
-            point_coords=None,
-            point_labels=None,
+            point_coords=point_coords,
+            point_labels=point_labels,
             box=input_box[None, :],
         )
         
@@ -174,27 +212,38 @@ def eval_zero_shot(val_img_path,val_json_path,sam_checkpoint_path, yolo_checkpoi
         new_seg["counts"] = new_seg["counts"].decode("utf-8")
         res[i]["segmentation"]=new_seg
 
+    res = [c for c in res if "segmentation" in c]  # drop instances of unreadable images
     for c in res:
          c.pop("bbox", None)
-    save_res_json_file= os.path.join(cwd, 'outputs', 'coco_res_tinysam.json')
+    save_res_json_file= os.path.join(outputs_dir, 'coco_res_tinysam.json' if max_count is None else f'coco_res_tinysam_{max_count}.json')
     
     with open(save_res_json_file, 'w') as fnew:
         json.dump(res, fnew)
         
+    if not res:
+        print("No detections/segmentations were produced; nothing to evaluate (AP = 0).")
+        return
+
     cocoGT= COCO(val_json_path)
     coco_dt = cocoGT.loadRes(res)
     coco_eval = COCOeval(cocoGT, coco_dt, "segm")
+    if max_count is not None:
+        coco_eval.params.imgIds = cocoGT.getImgIds()[:max_count]
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
     return 
 
 if __name__ == "__main__":
-    cwd = os.getcwd()
-    sam_checkpoint_path = os.path.join(cwd, 'checkpoints', 'tinysam_42.3.pth')
-    yolo_checkpoint_path = os.path.join(cwd, 'checkpoints', 'yolov12x.pt')
-    val_img_path = os.path.join(cwd, 'dataset', 'coco', 'images', 'val2017') + os.sep
-    val_json_path = os.path.join(cwd, 'dataset', 'coco', 'annotations', 'instances_val2017.json')
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-images", type=int, default=None, help="evaluate only the first N images")
+    parser.add_argument("--center-point", action="store_true", help="add a centre-point prompt to each box")
+    cli = parser.parse_args()
+
+    sam_checkpoint_path = str(ROOT / 'checkpoints' / 'tinysam_42.3.pth')
+    yolo_checkpoint_path = str(ROOT / 'checkpoints' / 'yolov12x.pt')
+    val_img_path = str(ROOT / 'dataset' / 'coco' / 'images' / 'val2017') + os.sep
+    val_json_path = str(ROOT / 'dataset' / 'coco' / 'annotations' / 'instances_val2017.json')
 
     # Set max_images=None to evaluate all; use a small number (e.g., 10) for quick testing
     eval_zero_shot(
@@ -202,4 +251,6 @@ if __name__ == "__main__":
         val_json_path=val_json_path,
         sam_checkpoint_path=sam_checkpoint_path,
         yolo_checkpoint_path=yolo_checkpoint_path,
+        max_count=cli.max_images,
+        use_center_points=cli.center_point,
     )

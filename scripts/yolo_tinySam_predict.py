@@ -25,12 +25,18 @@ print("CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("Device:", torch.cuda.get_device_name(0))
 
-def yolo12_tinysam_pipeline(image, yolov12_checkpoint="checkpoints/yolov12x.pt", classes=None):
+def yolo12_tinysam_pipeline(image, yolov12_checkpoint=str(ROOT / "checkpoints" / "yolov12x.pt"), classes=None):
     yolo_model = load_yolo_model(yolov12_checkpoint)
     # Step 1: YOLOv12 Prediction
-    xyxy, conf, cls = yolo12_predict(image, yolo_model, classes=classes)
+    det = yolo12_predict(image, yolo_model, classes=classes)
+    if isinstance(det, dict):  # nothing detected
+        return {"image": image, "instances": []}
+    xyxy, conf, cls = det
+    if len(xyxy) == 0:  # everything filtered out by `classes`
+        return {"image": image, "instances": []}
     # Segment each detection with TinySAM
-    seg_results = tinySam_predict(image, xyxy, use_center_points=True)
+    seg_results = tinySam_predict(image, xyxy, use_center_points=True,
+                                  checkpoint=ROOT / "checkpoints" / "tinysam_42.3.pth")
 
     # Bundle outputs
     instances = []
@@ -47,7 +53,7 @@ def yolo12_tinysam_pipeline(image, yolov12_checkpoint="checkpoints/yolov12x.pt",
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", default="figs/demo.png", help="Path to the input image")
+    parser.add_argument("--image_path", default=str(ROOT / "figs" / "demo.png"), help="Path to the input image")
     args = parser.parse_args()
 
     boxes = yolo12_tinysam_pipeline(args.image_path)
